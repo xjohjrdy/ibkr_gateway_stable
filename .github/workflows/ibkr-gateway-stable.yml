@@ -1,0 +1,180 @@
+name: IB Gateway Stable Release
+
+on:
+  schedule:
+    # Daily at 02:13 UTC. An off-peak minute reduces GitHub's cron scheduling delay.
+    - cron: '13 2 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Re-download and republish even if this version already has a release'
+        type: boolean
+        default: false
+
+# Required to create releases, upload assets and delete an incomplete release.
+permissions:
+  contents: write
+
+# Downloads take a while; never let two runs overlap.
+concurrency:
+  group: ibkr-gateway-stable
+  cancel-in-progress: false
+
+env:
+  GH_REPO: ${{ github.repository }}
+  VERSION_URL: 'https://download2.interactivebrokers.com/installers/ibgateway/stable-standalone/version.json?callback=ibgatewaystable_callback'
+  BASE_URL: 'https://download2.interactivebrokers.com/installers/ibgateway/stable-standalone'
+  # One installer per platform. Add or remove lines here and the expected
+  # asset count check below follows automatically.
+  ASSETS: |
+    ibgateway-stable-standalone-macos-arm.dmg
+    ibgateway-stable-standalone-macosx-x64.dmg
+    ibgateway-stable-standalone-windows-x64.exe
+    ibgateway-stable-standalone-linux-x64.sh
+    ibgateway-stable-standalone-linux-arm.sh
+
+jobs:
+  check:
+    name: Check latest version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      build_datetime: ${{ steps.parse.outputs.build_datetime }}
+      need_release: ${{ steps.decide.outputs.need_release }}
+    steps:
+      - name: Parse version.json
+        id: parse
+        run: |
+          set -euo pipefail
+
+          raw="$(curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --max-time 60 "$VERSION_URL" | tr -d '\r\n')"
+          echo "Raw response: $raw"
+
+          # Strip the JSONP wrapper: ibgatewaystable_callback({...});
+          json="${raw#*(}"
+          json="${json%)*}"
+
+          version="$(printf '%s' "$json" | jq -r '.buildVersion // empty')"
+          build_datetime="$(printf '%s' "$json" | jq -r '.buildDateTime // empty')"
+
+          if [ -z "$version" ]; then
+            echo "::error::Could not parse buildVersion from the response"
+            exit 1
+          fi
+
+          echo "Latest version: $version (built $build_datetime)"
+          {
+            echo "version=$version"
+            echo "build_datetime=$build_datetime"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to publish
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.parse.outputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          # Expected asset count = number of installers + SHA256SUMS
+          expected="$(( $(printf '%s\n' "$ASSETS" | grep -c .) + 1 ))"
+
+          if count="$(gh release view "$VERSION" --json assets --jq '.assets | length' 2>/dev/null)"; then
+            echo "Release $VERSION exists with $count assets (expected $expected)"
+            if [ "$count" -eq "$expected" ] && [ "${FORCE:-false}" != "true" ]; then
+              echo "No new version, skipping."
+              echo "need_release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # Incomplete assets (e.g. an interrupted upload) or a forced rebuild.
+            echo "Assets incomplete or force requested, deleting the old release."
+            gh release delete "$VERSION" --yes --cleanup-tag
+          else
+            echo "Release $VERSION does not exist, publishing."
+          fi
+
+          echo "need_release=true" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Download and publish ${{ needs.check.outputs.version }}
+    needs: check
+    if: needs.check.outputs.need_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Download installers
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          for f in $ASSETS; do
+            echo "::group::Downloading $f"
+            curl -fL \
+              --retry 5 --retry-delay 5 --retry-all-errors \
+              --connect-timeout 30 --max-time 3600 \
+              -A 'Mozilla/5.0' \
+              -C - -o "dist/$f" "$BASE_URL/$f"
+
+            size="$(stat -c%s "dist/$f")"
+            echo "$f: $size bytes"
+
+            if [ "$size" -lt 10485760 ]; then
+              echo "::error::$f is too small ($size bytes), the download probably failed"
+              exit 1
+            fi
+            # Guard against CDN error pages being saved instead of the installer.
+            if head -c 512 "dist/$f" | grep -qaiE '<html|<!doctype'; then
+              echo "::error::$f looks like an HTML page, not an installer"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+
+          ls -lh dist
+
+      - name: Generate SHA256 checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+          BUILD_DATETIME: ${{ needs.check.outputs.build_datetime }}
+        run: |
+          set -euo pipefail
+
+          cat > notes.md <<EOF
+          IB Gateway stable installers, mirrored automatically from Interactive Brokers.
+
+          - Version: ${VERSION}
+          - Build time: ${BUILD_DATETIME} (IBKR time)
+          - Source: ${BASE_URL}
+          - Checksums: see SHA256SUMS
+
+          | Platform | File |
+          |---|---|
+          | macOS (Apple Silicon) | ibgateway-stable-standalone-macos-arm.dmg |
+          | macOS (Intel) | ibgateway-stable-standalone-macosx-x64.dmg |
+          | Windows x64 | ibgateway-stable-standalone-windows-x64.exe |
+          | Linux x64 | ibgateway-stable-standalone-linux-x64.sh |
+          | Linux arm64 | ibgateway-stable-standalone-linux-arm.sh |
+          EOF
+
+          # Tag is the version string; all assets are attached in one go.
+          gh release create "$VERSION" dist/* \
+            --title "IB Gateway ${VERSION}" \
+            --notes-file notes.md
+
+      - name: Write job summary
+        if: always()
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          BUILD_DATETIME: ${{ needs.check.outputs.build_datetime }}
+        run: |
+          echo "IB Gateway version: **${VERSION}** (${BUILD_DATETIME})" >> "$GITHUB_STEP_SUMMARY"
